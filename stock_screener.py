@@ -204,11 +204,12 @@ def screen(data, min_score, min_vol_lots, lookback):
 
 
 # ------------------------------------------------------------------ 回測 ---
-def backtest(data, horizon, min_vol_lots, lookback):
+def backtest_table(data, horizon, min_vol_lots, lookback):
     """
     檢驗：訊號出現後 N 個交易日的報酬，對比「任意一天買進」的基準。
-    注意：訊號當天收盤才確定，這裡假設隔天開盤附近進場，
+    注意：訊號當天收盤才確定，這裡假設隔天進場，
     所以報酬由「訊號日隔天收盤」起算，以避免偷看未來。
+    回傳 DataFrame；沒有資料時回傳空表。
     """
     cols = ["RSI", "KD", "MA", "MTM", "MACD", "TLB"]
     frames = []
@@ -216,12 +217,10 @@ def backtest(data, horizon, min_vol_lots, lookback):
         if df["Volume"].tail(20).mean() / 1000 < min_vol_lots:
             continue
         sig = build_signals(df, lookback)
-        fwd = df["Close"].shift(-1 - horizon) / df["Close"].shift(-1) - 1
-        sig["fwd"] = fwd
+        sig["fwd"] = df["Close"].shift(-1 - horizon) / df["Close"].shift(-1) - 1
         frames.append(sig.dropna(subset=["fwd"]))
     if not frames:
-        print("沒有可回測的資料")
-        return
+        return pd.DataFrame()
     allr = pd.concat(frames)
     base = allr["fwd"]
 
@@ -238,11 +237,21 @@ def backtest(data, horizon, min_vol_lots, lookback):
     rows = [stat("基準(任一天買進)", pd.Series(True, index=allr.index))]
     rows += [stat(c, allr[c]) for c in cols]
     rows += [stat(f"分數>={k}", allr["score"] >= k) for k in (2, 3, 4, 5)]
-    out = pd.DataFrame(rows)
+    return pd.DataFrame(rows)
+
+
+BACKTEST_NOTE = ("提醒：樣本重疊、未計手續費與證交稅(約0.585%來回)，"
+                 "且有存活者偏差，結果僅供參考。")
+
+
+def backtest(data, horizon, min_vol_lots, lookback):
+    out = backtest_table(data, horizon, min_vol_lots, lookback)
+    if out.empty:
+        print("沒有可回測的資料")
+        return
     pd.set_option("display.width", 200)
     print(out.to_string(index=False))
-    print("\n提醒：樣本重疊、未計手續費與證交稅(約0.585%來回)，且有存活者偏差，"
-          "結果僅供參考。")
+    print("\n" + BACKTEST_NOTE)
 
 
 # ------------------------------------------------------------------ 主程式 ---
