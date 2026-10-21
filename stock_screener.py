@@ -181,8 +181,108 @@ def load_data(tickers, years: int):
     return data
 
 
+# ------------------------------------------------------- 自動股票池 ---
+TWSE_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+TPEX_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
+
+
+def _get_json(url):
+    import requests
+    hdr = {"User-Agent": "Mozilla/5.0"}
+    try:
+        r = requests.get(url, headers=hdr, timeout=30)
+    except requests.exceptions.SSLError:  # 政府網站憑證偶有問題
+        import urllib3
+        urllib3.disable_warnings()
+        r = requests.get(url, headers=hdr, timeout=30, verify=False)
+    r.raise_for_status()
+    return r.json()
+
+
+def _num(x):
+    try:
+        return float(str(x).replace(",", "").strip())
+    except ValueError:
+        return np.nan
+
+
+def _pick(cols, *keywords):
+    for kw in keywords:
+        for c in cols:
+            if kw.lower() in c.lower():
+                return c
+    return None
+
+
+def fetch_universe(top_n: int = 100, include_otc: bool = True) -> pd.DataFrame:
+    """
+    從證交所/櫃買中心公開資料抓全部上市櫃股票，只留 4 碼一般股票（排除 ETF、權證等），
+    依最近交易日成交金額由大到小取前 top_n 檔。
+    回傳欄位：code, name, value, ticker
+    """
+    frames = []
+    # 上市
+    try:
+        d = pd.DataFrame(_get_json(TWSE_URL))
+        f = pd.DataFrame({"code": d["Code"].astype(str).str.strip(),
+                          "name": d["Name"],
+                          "value": d["TradeValue"].map(_num)})
+        f["ticker"] = f["code"] + ".TW"
+        frames.append(f)
+    except Exception as e:
+        print(f"[警告] 上市清單抓取失敗：{e}", file=sys.stderr)
+    # 上櫃（欄位名稱用模糊比對，抓不到就略過）
+    if include_otc:
+        try:
+            d = pd.DataFrame(_get_json(TPEX_URL))
+            c_code = _pick(d.columns, "CompanyCode", "Code")
+            c_name = _pick(d.columns, "CompanyName", "Name")
+            c_val = _pick(d.columns, "TransactionAmount", "TradingAmount", "Amount")
+            f = pd.DataFrame({"code": d[c_code].astype(str).str.strip(),
+                              "name": d[c_name],
+                              "value": d[c_val].map(_num)})
+            f["ticker"] = f["code"] + ".TWO"
+            frames.append(f)
+        except Exception as e:
+            print(f"[警告] 上櫃清單抓取失敗，只使用上市：{e}", file=sys.stderr)
+    if not frames:
+        return pd.DataFrame(columns=["code", "name", "value", "ticker"])
+    u = pd.concat(frames, ignore_index=True)
+    u = u[u["code"].str.fullmatch(r"[1-9]\d{3}")].dropna(subset=["value"])
+    return u.sort_values("value", ascending=False).head(top_n).reset_index(drop=True)
+
+
+def load_data_batch(tickers, years: float, chunk: int = 40):
+    """分批一次下載多檔（比逐檔快）。代號需已含 .TW / .TWO。"""
+    try:
+        import yfinance as yf
+    except ImportError:
+        sys.exit("請先安裝： pip install yfinance")
+    end = dt.date.today() + dt.timedelta(days=1)
+    start = end - dt.timedelta(days=int(365 * years) + 30)
+    data = {}
+    tickers = list(tickers)
+    for i in range(0, len(tickers), chunk):
+        part = tickers[i:i + chunk]
+        try:
+            raw = yf.download(part, start=start, end=end, auto_adjust=True,
+                              progress=False, group_by="ticker", threads=True)
+        except Exception as e:
+            print(f"[略過] 一批下載失敗：{e}", file=sys.stderr)
+            continue
+        for t in part:
+            try:
+                df = raw[t] if isinstance(raw.columns, pd.MultiIndex) else raw
+                df = df.dropna(subset=["Close"])
+            except KeyError:
+                continue
+            if len(df) >= 80:
+                data[t] = df
+    return data
+
+
 # ------------------------------------------------------------------ 篩選 ---
-def screen(data, min_score, min_vol_lots, lookback):
+def screen(data, min_score, min_vol_lots, lookback, names=None):
     rows = []
     for t, df in data.items():
         avg_lots = df["Volume"].tail(20).mean() / 1000  # 股 -> 張
@@ -192,6 +292,7 @@ def screen(data, min_score, min_vol_lots, lookback):
         if s["score"] >= min_score:
             rows.append({
                 "代號": t.split(".")[0],
+                **({"名稱": names.get(t, "")} if names else {}),
                 "收盤": round(float(df["Close"].iloc[-1]), 2),
                 "分數": int(s["score"]),
                 "20日均量(張)": int(avg_lots),
