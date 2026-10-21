@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+# 輸出結果與個人股票清單不上傳
+screener_*.csv
+my_list.txt
